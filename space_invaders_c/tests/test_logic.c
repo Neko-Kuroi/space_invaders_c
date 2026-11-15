@@ -167,9 +167,28 @@ static void test_weapon_volley(void)
     CHECK(weapon_volley(5000, 6, true, false, &sound) == 0 && sound == 0);
 }
 
+static void test_counter_advance(void)
+{
+    bool w = false;
+    /* 通常の巡回: 4→3 は包まない */
+    CHECK(fleet_counter_advance(4, 0, 4, &w) == 3 && !w);
+    /* 一番下の行が動いたあと包む（min_row=0 で 0→-1） */
+    CHECK(fleet_counter_advance(0, 0, 4, &w) == 4 && w);
+    /* 上の行が全滅した直後（min_row=2）: 一番上の行が動いたら包む */
+    CHECK(fleet_counter_advance(2, 2, 4, &w) == 4 && w);
+    CHECK(fleet_counter_advance(3, 2, 4, &w) == 2 && !w);
+    /* 止まるパターンの回帰: カウンタが min_row-1 ちょうど／それ以下でも
+     * 包み直して復帰する（旧い == 判定では両方とも止まった） */
+    CHECK(fleet_counter_advance(1, 2, 4, &w) == 4 && w);
+    CHECK(fleet_counter_advance(0, 2, 4, &w) == 4 && w);
+    /* 大きく負に沈んだ持ち越し状態からも1回で復帰する */
+    CHECK(fleet_counter_advance(-50, 0, 4, &w) == 4 && w);
+}
+
 int main(void)
 {
     test_init_and_scores();
+    test_counter_advance();
     test_kill_bookkeeping();
     test_speed_table();
     test_min_max_row();

@@ -21,6 +21,12 @@
 #define ENEMY_MOVE_DOWN 35
 #define BLOCKERS_POSITION 450
 
+/* ミステリーシップ出現音の専用チャンネル。main.c が起動時に
+ * Mix_ReserveChannels(1) で予約する。通常の効果音（-1 指定）は
+ * このチャンネルを使わないので、後からのフェードアウトや停止が
+ * 別の音にかかることはない。 */
+#define MYSTERY_CHANNEL 0
+
 #define MAX_PBULLETS 24
 #define MAX_EBULLETS 64
 #define MAX_EXPLOSIONS 80

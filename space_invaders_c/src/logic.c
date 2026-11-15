@@ -131,6 +131,17 @@ bool ledger_bottom_enemy(const FleetLedger *l, int pick, int *out_row, int *out_
     return false;
 }
 
+int fleet_counter_advance(int counter, int min_row, int max_row, bool *wrapped)
+{
+    counter -= 1;
+    if (counter <= min_row - 1) {
+        *wrapped = true;
+        return max_row;
+    }
+    *wrapped = false;
+    return counter;
+}
+
 int score_for_row(int row)
 {
     static const int scores[FLEET_ROWS] = {30, 20, 20, 10, 10};

@@ -81,6 +81,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "Mix_OpenAudio failed: %s\n", Mix_GetError());
         return 1;
     }
+    /* チャンネル0をミステリーシップ出現音の専用に予約する（game.h） */
+    Mix_ReserveChannels(1);
 
     SDL_Window *window = SDL_CreateWindow(
         "Space Invaders", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,

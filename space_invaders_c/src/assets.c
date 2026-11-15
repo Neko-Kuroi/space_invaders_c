@@ -123,3 +123,10 @@ int assets_play(Assets *a, int snd)
         return -1;
     return Mix_PlayChannel(-1, a->snd[snd], 0);
 }
+
+int assets_play_on(Assets *a, int snd, int channel)
+{
+    if (snd < 0 || snd >= SND_COUNT || !a->snd[snd])
+        return -1;
+    return Mix_PlayChannel(channel, a->snd[snd], 0);
+}

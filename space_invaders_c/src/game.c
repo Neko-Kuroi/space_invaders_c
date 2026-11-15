@@ -151,6 +151,7 @@ static void reset_round(Game *g, int score, Uint32 now)
         }
     }
     ledger_init(&g->ledger); /* move_time=200, level=700 を含む初期化 */
+    g->row_counter = 4; /* 原典の修正に合わせ、開始時に初期値へ戻す */
     g->fleet_direction = 1;
     g->move_number = 15;
     g->left_moves = 30;
@@ -262,11 +263,12 @@ static void fleet_update(Game *g, Uint32 now)
                     e->image_index ^= 1;
                 }
             }
-            g->row_counter -= 1;
-            if (g->row_counter == l->min_row - 1) {
-                g->row_counter = l->max_row;
+            bool wrapped = false;
+            g->row_counter = fleet_counter_advance(g->row_counter,
+                                                   l->min_row, l->max_row,
+                                                   &wrapped);
+            if (wrapped)
                 g->move_number += 1;
-            }
         }
     }
     g->fleet_timer += (Uint32)l->move_time;
@@ -324,7 +326,10 @@ static void mystery_update(Game *g, Uint32 now)
     bool reset_timer = false;
     if (passed > 25000) {
         if ((m->r.x < 0 || m->r.x > 800) && m->play_sound) {
-            m->channel = assets_play(g->assets, SND_MYSTERYENTERED);
+            /* 専用チャンネル（予約済み）で鳴らす。以後のフェードアウトや
+             * 停止はこの音にだけかかる */
+            m->channel = assets_play_on(g->assets, SND_MYSTERYENTERED,
+                                        MYSTERY_CHANNEL);
             m->play_sound = false;
         }
         if (m->r.x < 840 && m->direction == 1) {
@@ -400,6 +405,43 @@ static void kill_enemy_no_score(Game *g, Enemy *e)
     ledger_kill(&g->ledger, e->row, e->col);
     if (g->ledger.count == 0)
         g->fleet_bottom = 0; /* 後段の判定が空の集団で誤作動しないように */
+}
+
+/* 弾とトーチカ／地面の衝突（原典の groupcollide 相当）。
+ * 原典は重なったセルを全部消すので、自機弾・敵弾とも同じ規則で
+ * 全セルを消す。敵弾のときは原典どおり bulletExplosion を置く。 */
+static void bullets_vs_blockers(Game *g, bool enemy, Uint32 now)
+{
+    Bullet *arr = enemy ? g->ebullets : g->pbullets;
+    int cap = enemy ? MAX_EBULLETS : MAX_PBULLETS;
+    for (int i = 0; i < cap; i++) {
+        Bullet *b = &arr[i];
+        if (!b->active) continue;
+        bool hit = false;
+        for (int base = 0; base < 4; base++)
+            for (int r = 0; r < BARRIER_ROWS; r++)
+                for (int c = 0; c < BARRIER_COLS; c++) {
+                    if (!g->blockers[base][r][c]) continue;
+                    SDL_Rect cell = blocker_cell_rect(base, r, c);
+                    if (overlap(&b->r, &cell)) {
+                        g->blockers[base][r][c] = false;
+                        hit = true;
+                    }
+                }
+        for (int gi = 0; gi < 200; gi++) {
+            if (!g->ground[gi]) continue;
+            SDL_Rect cell = {gi * 4, 595, 4, 4};
+            if (overlap(&b->r, &cell)) {
+                g->ground[gi] = false;
+                hit = true;
+            }
+        }
+        if (hit) {
+            b->active = false;
+            if (enemy)
+                spawn_explosion(g, EX_BULLET, b->r, 0, 0, now);
+        }
+    }
 }
 
 static void check_collisions(Game *g, Uint32 now)
@@ -497,64 +539,10 @@ static void check_collisions(Game *g, Uint32 now)
             enter_game_over(g, now);
     }
 
-    /* (f) 自機弾 × トーチカ・地面: 当たったセルと弾が消える */
-    for (int i = 0; i < MAX_PBULLETS; i++) {
-        Bullet *b = &g->pbullets[i];
-        if (!b->active) continue;
-        bool hit = false;
-        for (int base = 0; base < 4 && !hit; base++)
-            for (int r = 0; r < BARRIER_ROWS && !hit; r++)
-                for (int c = 0; c < BARRIER_COLS && !hit; c++) {
-                    if (!g->blockers[base][r][c]) continue;
-                    SDL_Rect cell = blocker_cell_rect(base, r, c);
-                    if (overlap(&b->r, &cell)) {
-                        g->blockers[base][r][c] = false;
-                        hit = true;
-                    }
-                }
-        if (!hit && b->r.y + b->r.h >= 595) {
-            /* 地面: 原典の地面ブロックは y=595 の 4x4 */
-            for (int gi = 0; gi < 200; gi++) {
-                if (!g->ground[gi]) continue;
-                SDL_Rect cell = {gi * 4, 595, 4, 4};
-                if (overlap(&b->r, &cell)) {
-                    g->ground[gi] = false;
-                    hit = true;
-                }
-            }
-        }
-        if (hit)
-            b->active = false;
-    }
-
-    /* (g) 敵弾 × トーチカ・地面: セルと弾が消え、弾の爆発が出る */
-    for (int j = 0; j < MAX_EBULLETS; j++) {
-        Bullet *eb = &g->ebullets[j];
-        if (!eb->active) continue;
-        bool hit = false;
-        for (int base = 0; base < 4; base++)
-            for (int r = 0; r < BARRIER_ROWS; r++)
-                for (int c = 0; c < BARRIER_COLS; c++) {
-                    if (!g->blockers[base][r][c]) continue;
-                    SDL_Rect cell = blocker_cell_rect(base, r, c);
-                    if (overlap(&eb->r, &cell)) {
-                        g->blockers[base][r][c] = false;
-                        hit = true;
-                    }
-                }
-        for (int gi = 0; gi < 200; gi++) {
-            if (!g->ground[gi]) continue;
-            SDL_Rect cell = {gi * 4, 595, 4, 4};
-            if (overlap(&eb->r, &cell)) {
-                g->ground[gi] = false;
-                hit = true;
-            }
-        }
-        if (hit) {
-            eb->active = false;
-            spawn_explosion(g, EX_BULLET, eb->r, 0, 0, now);
-        }
-    }
+    /* (f) 自機弾 × トーチカ・地面、(g) 敵弾 × トーチカ・地面。
+     * 原典の groupcollide はどちらも重なった全セルを消すので共通化した */
+    bullets_vs_blockers(g, false, now);
+    bullets_vs_blockers(g, true, now);
 
     /* (h) 敵集団がトーチカの高さまで来たら、重なったセルが消える */
     if (g->fleet_bottom >= BLOCKERS_POSITION) {
@@ -571,7 +559,24 @@ static void check_collisions(Game *g, Uint32 now)
                     }
         }
     }
-    (void)now;
+}
+
+/* 爆発の寿命の管理（原典の各 Explosion.update の消滅条件）。
+ * 描画側では状態を書き換えないよう、消滅判定はここ（更新側）に置く。
+ * ラウンド遷移の条件（explosion_count == 0）も更新側だけで決まる。 */
+static void explosions_update(Game *g, Uint32 now)
+{
+    for (int i = 0; i < MAX_EXPLOSIONS; i++) {
+        Explosion *ex = &g->explosions[i];
+        if (!ex->active) continue;
+        Uint32 passed = now - ex->born;
+        switch (ex->type) {
+        case EX_ENEMY:         if (passed > 400) ex->active = false; break;
+        case EX_SHIP:          if (passed > 800) ex->active = false; break;
+        case EX_BULLET:        if (passed > 300) ex->active = false; break;
+        case EX_MYSTERY_SCORE: if (passed > 600) ex->active = false; break;
+        }
+    }
 }
 
 /* ---- 状態ごとの更新 ---- */
@@ -637,6 +642,7 @@ int game_update(Game *g, const Input *in, Uint32 now)
             ship_update(g, in);
         bullets_update(g, now);
         mystery_update(g, now);
+        explosions_update(g, now);
         check_collisions(g, now);
         if (g->state == ST_PLAY) {
             create_new_ship(g, now);
@@ -694,20 +700,17 @@ static void draw_explosions(Game *g, SDL_Renderer *ren, Uint32 now)
         Explosion *ex = &g->explosions[i];
         if (!ex->active) continue;
         Uint32 passed = now - ex->born;
+        /* 描画は読むだけ。消滅の判定は explosions_update（更新側）にある */
         switch (ex->type) {
         case EX_ENEMY:
             if (passed <= 100)
                 draw_tex(g, ren, explosion_texture(ex->row), ex->r.x, ex->r.y, 40, 35);
             else if (passed <= 200)
                 draw_tex(g, ren, explosion_texture(ex->row), ex->r.x - 6, ex->r.y - 6, 50, 45);
-            else if (passed > 400)
-                ex->active = false;
             break;
         case EX_SHIP: {
-            if (passed > 800) {
-                ex->active = false;
+            if (passed > 800)
                 break;
-            }
             int step = (int)(passed / 100);
             if (step > 7) step = 7;
             draw_tex(g, ren, ship_steps[step], ex->r.x, ex->r.y, 50, 48);
@@ -716,8 +719,6 @@ static void draw_explosions(Game *g, SDL_Renderer *ren, Uint32 now)
         case EX_BULLET:
             if (passed <= 300)
                 draw_tex(g, ren, TEX_ENEMYLASER1, ex->r.x, ex->r.y, 5, 15);
-            else
-                ex->active = false;
             break;
         case EX_MYSTERY_SCORE:
             if (passed <= 200 || (passed > 400 && passed <= 600)) {
@@ -725,8 +726,6 @@ static void draw_explosions(Game *g, SDL_Renderer *ren, Uint32 now)
                 snprintf(buf, sizeof buf, "%d", ex->score);
                 assets_draw_text(g->assets, ren, 20, buf, COL_WHITE,
                                  ex->r.x + 20, ex->r.y + 6);
-            } else if (passed > 600) {
-                ex->active = false;
             }
             break;
         }

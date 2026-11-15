@@ -60,6 +60,14 @@ int mystery_score_for_pick(int pick);
 int weapon_volley(int score, int round_num, bool bullets_empty, bool ship_alive,
                   int *out_sound);
 
+/* 敵集団の波状移動で ROW_counter を1つ進める規則。
+ * counter を -1 し、min_row-1 以下になったら max_row に包み直して
+ * *wrapped を真にする（moveNumber の加算は呼び出し側の仕事）。
+ * 包み直しの条件は、原典の修正（一致判定 == から <= へ）を反映したもの。
+ * 一致だけだと、上の行が全滅して min_row が上がったときにカウンタが
+ * 条件を飛び越え、敵集団が止まってしまう。 */
+int fleet_counter_advance(int counter, int min_row, int max_row, bool *wrapped);
+
 /* トーチカの設計表（原典 make_blockers1 の barrierDesign）。
  * 16行×26列、先頭行は空。1 のセルに 3x3 のブロックが置かれる。
  * 1基あたり318セル（原典で実測）。 */

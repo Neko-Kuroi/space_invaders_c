@@ -52,4 +52,9 @@ void assets_draw_text(Assets *a, SDL_Renderer *renderer, int size,
 /* 音量は原典どおり全て 0.1。channel を返す（-1 は失敗）。 */
 int assets_play(Assets *a, int snd);
 
+/* チャンネルを指定して再生する。ミステリーシップの出現音のように、
+ * 後からフェードアウトや停止をかける音は、Mix_ReserveChannels で
+ * 予約した専用チャンネルで鳴らす（番号の使い回しで別の音を切らない）。 */
+int assets_play_on(Assets *a, int snd, int channel);
+
 #endif /* SI_ASSETS_H */
