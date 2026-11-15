@@ -48,7 +48,8 @@ static void join_path(char *dst, size_t cap, const char *base, const char *rel)
     snprintf(dst, cap, "%s%s", base, rel);
 }
 
-int assets_load(Assets *a, SDL_Renderer *renderer, const char *base_path)
+int assets_load(Assets *a, SDL_Renderer *renderer, const char *base_path,
+                int load_sounds)
 {
     char path[1024];
     memset(a, 0, sizeof *a);
@@ -58,20 +59,23 @@ int assets_load(Assets *a, SDL_Renderer *renderer, const char *base_path)
         SDL_Surface *surf = IMG_Load(path);
         if (!surf) {
             fprintf(stderr, "image load failed: %s: %s\n", path, IMG_GetError());
+            assets_free(a);
             return 0;
         }
         a->tex[i] = SDL_CreateTextureFromSurface(renderer, surf);
         SDL_FreeSurface(surf);
         if (!a->tex[i]) {
             fprintf(stderr, "texture create failed: %s\n", path);
+            assets_free(a);
             return 0;
         }
     }
-    for (int i = 0; i < SND_COUNT; i++) {
+    for (int i = 0; load_sounds && i < SND_COUNT; i++) {
         join_path(path, sizeof path, base_path, SND_FILES[i]);
         a->snd[i] = Mix_LoadWAV(path);
         if (!a->snd[i]) {
             fprintf(stderr, "sound load failed: %s: %s\n", path, Mix_GetError());
+            assets_free(a);
             return 0;
         }
         /* 原典は全ての音を set_volume(0.1) している */
@@ -84,6 +88,7 @@ int assets_load(Assets *a, SDL_Renderer *renderer, const char *base_path)
     a->font50 = TTF_OpenFont(path, 50);
     if (!a->font20 || !a->font25 || !a->font50) {
         fprintf(stderr, "font load failed: %s: %s\n", path, TTF_GetError());
+        assets_free(a);
         return 0;
     }
     return 1;

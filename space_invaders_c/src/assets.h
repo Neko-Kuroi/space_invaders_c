@@ -41,8 +41,11 @@ typedef struct {
 } Assets;
 
 /* base_path は素材フォルダのあるディレクトリ（末尾に '/' を含む想定）。
- * 失敗したら stderr に理由を出して 0 を返す。 */
-int assets_load(Assets *a, SDL_Renderer *renderer, const char *base_path);
+ * load_sounds が 0 のときは音を読まない（音声デバイスが使えない環境用）。
+ * その場合 snd[] は NULL のままで、assets_play 系は何もせず -1 を返す。
+ * 失敗したら stderr に理由を出し、読み込み済みの分を解放して 0 を返す。 */
+int assets_load(Assets *a, SDL_Renderer *renderer, const char *base_path,
+                int load_sounds);
 void assets_free(Assets *a);
 
 /* 文字をその場で描く（原典の Text.draw 相当）。size は 20/25/50 のみ。 */

@@ -21,6 +21,33 @@
 #define ENEMY_MOVE_DOWN 35
 #define BLOCKERS_POSITION 450
 
+/* 自機 */
+#define SHIP_START_X 375
+#define SHIP_START_Y 540
+#define SHIP_W 50
+#define SHIP_H 50
+#define SHIP_RESPAWN_MS 1600        /* 被弾から再出撃まで */
+
+/* 進行の時間 */
+#define NEXT_ROUND_DELAY_MS 3000    /* 全滅から次のラウンドまで */
+#define MYSTERY_INTERVAL_MS 25000   /* ミステリーシップの出現周期 */
+
+/* 敵集団の到達ライン（fleet_bottom との比較） */
+#define FLEET_REACH_SHIP_Y SHIP_START_Y  /* 自機の高さ。重なれば自機が消える */
+#define FLEET_GAMEOVER_Y 600             /* ここまで来たらゲームオーバー */
+
+/* トーチカ（4基。1セル 3x3、BARRIER_COLS x BARRIER_ROWS のセル） */
+#define BLOCKER_COUNT 4
+#define BLOCKER_X0 60
+#define BLOCKER_PITCH 200
+#define BLOCKER_Y_OFFSET 25         /* BLOCKERS_POSITION からの下がり */
+#define BLOCKER_CELL 3
+
+/* 地面（y=GROUND_Y に 4x4 のセルを横一列） */
+#define GROUND_Y 595
+#define GROUND_CELLS 200
+#define GROUND_CELL_W 4
+
 /* ミステリーシップ出現音の専用チャンネル。main.c が起動時に
  * Mix_ReserveChannels(1) で予約する。通常の効果音（-1 指定）は
  * このチャンネルを使わないので、後からのフェードアウトや停止が
@@ -114,8 +141,8 @@ typedef struct {
     Mystery mystery;
     Explosion explosions[MAX_EXPLOSIONS];
 
-    bool blockers[4][BARRIER_ROWS][BARRIER_COLS];
-    bool ground[200];       /* y=595 の地面（1セル 4px） */
+    bool blockers[BLOCKER_COUNT][BARRIER_ROWS][BARRIER_COLS];
+    bool ground[GROUND_CELLS]; /* 地面（1セル GROUND_CELL_W px） */
 
     Uint32 shoot_timer;     /* 原典 self.timer（敵の発射間隔の基準） */
     Uint32 note_timer;
@@ -127,7 +154,8 @@ typedef struct {
 void game_init(Game *g, Assets *assets);
 /* 1フレーム分の更新。now は SDL_GetTicks()。戻り値 0 で終了。 */
 int game_update(Game *g, const Input *in, Uint32 now);
-/* 現在の状態を描く。 */
-void game_render(Game *g, SDL_Renderer *renderer);
+/* 現在の状態を描く。now は game_update に渡したものと同じ時刻を使う
+ * （更新と描画で時刻がずれないようにするため）。 */
+void game_render(Game *g, SDL_Renderer *renderer, Uint32 now);
 
 #endif /* SI_GAME_H */

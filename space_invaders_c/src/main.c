@@ -54,6 +54,23 @@ static void build_input(Input *in, int smoke_frame)
     }
 }
 
+/* 目標は 60fps。フレームの長さを整数ミリ秒に丸めると 62.5fps になって
+ * フレーム単位で動く量（弾の速さなど）がわずかに速くなるため、
+ * 高精度タイマーで「次のフレームの開始時刻」を積み上げて待つ。 */
+static void wait_for_next_frame(Uint64 *next, Uint64 freq)
+{
+    *next += freq / 60;
+    Uint64 t = SDL_GetPerformanceCounter();
+    if (*next > t) {
+        Uint32 ms = (Uint32)((*next - t) * 1000 / freq);
+        if (ms > 0)
+            SDL_Delay(ms);
+    } else if (t - *next > freq / 10) {
+        /* 大きく遅れたら（ウィンドウ移動など）追いつこうとせず仕切り直す */
+        *next = t;
+    }
+}
+
 int main(int argc, char **argv)
 {
     (void)argc;
@@ -64,63 +81,80 @@ int main(int argc, char **argv)
 
     srand((unsigned)(SDL_GetTicks() ^ time(NULL)));
 
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) {
+    int status = 1;
+    SDL_Window *window = NULL;
+    SDL_Renderer *renderer = NULL;
+    Assets assets;
+    bool assets_ready = false;
+    bool img_ready = false, ttf_ready = false, audio_ready = false;
+
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return 1;
     }
     if ((IMG_Init(IMG_INIT_PNG | IMG_INIT_JPG) & (IMG_INIT_PNG | IMG_INIT_JPG)) == 0) {
         fprintf(stderr, "IMG_Init failed: %s\n", IMG_GetError());
-        return 1;
+        goto done;
     }
+    img_ready = true;
     if (TTF_Init() != 0) {
         fprintf(stderr, "TTF_Init failed: %s\n", TTF_GetError());
-        return 1;
+        goto done;
     }
-    /* 原典の mixer.pre_init(44100, -16, 1, 4096) に合わせる */
-    if (Mix_OpenAudio(44100, AUDIO_S16SYS, 1, 4096) != 0) {
-        fprintf(stderr, "Mix_OpenAudio failed: %s\n", Mix_GetError());
-        return 1;
-    }
-    /* チャンネル0をミステリーシップ出現音の専用に予約する（game.h） */
-    Mix_ReserveChannels(1);
+    ttf_ready = true;
 
-    SDL_Window *window = SDL_CreateWindow(
+    /* 音は無くても遊べるので、音声デバイスが使えなくても続行する
+     * （WSL・CI・音声デバイスのない環境など）。
+     * 原典の mixer.pre_init(44100, -16, 1, 4096) に合わせる。 */
+    if (SDL_InitSubSystem(SDL_INIT_AUDIO) == 0 &&
+        Mix_OpenAudio(44100, AUDIO_S16SYS, 1, 4096) == 0) {
+        audio_ready = true;
+        /* チャンネル0をミステリーシップ出現音の専用に予約する（game.h） */
+        Mix_ReserveChannels(1);
+    } else {
+        fprintf(stderr, "audio unavailable, continuing without sound: %s\n",
+                SDL_GetError()[0] ? SDL_GetError() : Mix_GetError());
+    }
+
+    window = SDL_CreateWindow(
         "Space Invaders", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         SCREEN_W, SCREEN_H, SDL_WINDOW_RESIZABLE);
     if (!window) {
         fprintf(stderr, "window failed: %s\n", SDL_GetError());
-        return 1;
+        goto done;
     }
-    SDL_Renderer *renderer = SDL_CreateRenderer(
+    renderer = SDL_CreateRenderer(
         window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     if (!renderer)
         renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
     if (!renderer) {
         fprintf(stderr, "renderer failed: %s\n", SDL_GetError());
-        return 1;
+        goto done;
     }
     /* 原典の SCALED 相当: 論理画面を 800x600 に固定する */
     SDL_RenderSetLogicalSize(renderer, SCREEN_W, SCREEN_H);
 
     char *base = SDL_GetBasePath();
-    Assets assets;
-    if (!assets_load(&assets, renderer, base ? base : "./")) {
-        if (base) SDL_free(base);
-        return 1;
-    }
-    if (base) SDL_free(base);
+    assets_ready = assets_load(&assets, renderer, base ? base : "./", audio_ready);
+    if (base)
+        SDL_free(base);
+    if (!assets_ready)
+        goto done;
 
     Game game;
     game_init(&game, &assets);
 
+    const Uint64 freq = SDL_GetPerformanceFrequency();
+    Uint64 next_frame = SDL_GetPerformanceCounter();
     int frame = 0;
     int running = 1;
     while (running) {
-        Uint32 frame_start = SDL_GetTicks();
+        /* 更新と描画で同じ時刻を使う（爆発の経過時間などがずれないように） */
+        Uint32 now = SDL_GetTicks();
         Input in;
         build_input(&in, smoke_frames >= 0 ? frame : -1);
-        running = game_update(&game, &in, frame_start);
-        game_render(&game, renderer);
+        running = game_update(&game, &in, now);
+        game_render(&game, renderer, now);
         frame++;
 
         if (smoke_frames >= 0 && frame >= smoke_frames) {
@@ -130,18 +164,23 @@ int main(int argc, char **argv)
             break;
         }
 
-        /* 原典の clock.tick(60) 相当 */
-        Uint32 elapsed = SDL_GetTicks() - frame_start;
-        if (elapsed < 16)
-            SDL_Delay(16 - elapsed);
+        wait_for_next_frame(&next_frame, freq);
     }
+    status = 0;
 
-    assets_free(&assets);
-    SDL_DestroyRenderer(renderer);
-    SDL_DestroyWindow(window);
-    Mix_CloseAudio();
-    TTF_Quit();
-    IMG_Quit();
+done:
+    if (assets_ready)
+        assets_free(&assets);
+    if (renderer)
+        SDL_DestroyRenderer(renderer);
+    if (window)
+        SDL_DestroyWindow(window);
+    if (audio_ready)
+        Mix_CloseAudio();
+    if (ttf_ready)
+        TTF_Quit();
+    if (img_ready)
+        IMG_Quit();
     SDL_Quit();
-    return 0;
+    return status;
 }

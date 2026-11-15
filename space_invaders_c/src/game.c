@@ -106,29 +106,86 @@ static void spawn_bullet(Game *g, bool enemy, int x, int y, int direction,
  * 重なって生成されるため、見た目と判定が等価な1本にまとめた。 */
 static void build_blockers(Game *g)
 {
-    for (int b = 0; b < 4; b++)
+    for (int b = 0; b < BLOCKER_COUNT; b++)
         for (int r = 0; r < BARRIER_ROWS; r++)
             for (int c = 0; c < BARRIER_COLS; c++)
                 g->blockers[b][r][c] = BARRIER_DESIGN[r][c] != 0;
-    for (int i = 0; i < 200; i++)
+    for (int i = 0; i < GROUND_CELLS; i++)
         g->ground[i] = true;
 }
 
 static SDL_Rect blocker_cell_rect(int base, int row, int col)
 {
-    SDL_Rect r = {60 + 200 * base + col * 3, BLOCKERS_POSITION + 25 + row * 3, 3, 3};
+    SDL_Rect r = {BLOCKER_X0 + BLOCKER_PITCH * base + col * BLOCKER_CELL,
+                  BLOCKERS_POSITION + BLOCKER_Y_OFFSET + row * BLOCKER_CELL,
+                  BLOCKER_CELL, BLOCKER_CELL};
     return r;
+}
+
+/* 1基ぶんのセル全体を囲む矩形。弾や敵がここに触れないなら、その基の
+ * セルは1つずつ調べなくてよい（早期除外）。 */
+static SDL_Rect blocker_base_area(int base)
+{
+    SDL_Rect r = {BLOCKER_X0 + BLOCKER_PITCH * base,
+                  BLOCKERS_POSITION + BLOCKER_Y_OFFSET,
+                  BARRIER_COLS * BLOCKER_CELL, BARRIER_ROWS * BLOCKER_CELL};
+    return r;
+}
+
+/* r に重なるトーチカのセルを全部消す（原典の groupcollide の dokill）。
+ * 1つでも消したら true。 */
+static bool blockers_erase_overlap(Game *g, const SDL_Rect *r)
+{
+    bool hit = false;
+    for (int base = 0; base < BLOCKER_COUNT; base++) {
+        SDL_Rect area = blocker_base_area(base);
+        if (!overlap(r, &area))
+            continue;
+        for (int row = 0; row < BARRIER_ROWS; row++)
+            for (int col = 0; col < BARRIER_COLS; col++) {
+                if (!g->blockers[base][row][col]) continue;
+                SDL_Rect cell = blocker_cell_rect(base, row, col);
+                if (overlap(r, &cell)) {
+                    g->blockers[base][row][col] = false;
+                    hit = true;
+                }
+            }
+    }
+    return hit;
+}
+
+/* r に重なる地面のセルを全部消す。1つでも消したら true。 */
+static bool ground_erase_overlap(Game *g, const SDL_Rect *r)
+{
+    if (r->y + r->h <= GROUND_Y || r->y >= GROUND_Y + GROUND_CELL_W)
+        return false;
+    bool hit = false;
+    for (int gi = 0; gi < GROUND_CELLS; gi++) {
+        if (!g->ground[gi]) continue;
+        SDL_Rect cell = {gi * GROUND_CELL_W, GROUND_Y, GROUND_CELL_W, GROUND_CELL_W};
+        if (overlap(r, &cell)) {
+            g->ground[gi] = false;
+            hit = true;
+        }
+    }
+    return hit;
+}
+
+/* 自機を初期位置に置く（開始・ラウンド開始・再出撃で共通）。 */
+static void ship_place(Ship *s)
+{
+    s->r.x = SHIP_START_X;
+    s->r.y = SHIP_START_Y;
+    s->r.w = SHIP_W;
+    s->r.h = SHIP_H;
+    s->vx = SHIP_VX;
 }
 
 /* 原典 reset(score)。残機（lives_spare）はここでは変えない。 */
 static void reset_round(Game *g, int score, Uint32 now)
 {
     g->score = score;
-    g->ship.r.x = 375;
-    g->ship.r.y = 540;
-    g->ship.r.w = 50;
-    g->ship.r.h = 50;
-    g->ship.vx = SHIP_VX;
+    ship_place(&g->ship);
     g->ship_alive = true;
     g->make_new_ship = false;
     g->ship_timer = now;
@@ -324,7 +381,7 @@ static void mystery_update(Game *g, Uint32 now)
     m->visible = false;
     Uint32 passed = now - m->timer;
     bool reset_timer = false;
-    if (passed > 25000) {
+    if (passed > MYSTERY_INTERVAL_MS) {
         if ((m->r.x < 0 || m->r.x > 800) && m->play_sound) {
             /* 専用チャンネル（予約済み）で鳴らす。以後のフェードアウトや
              * 停止はこの音にだけかかる */
@@ -354,7 +411,7 @@ static void mystery_update(Game *g, Uint32 now)
         m->direction = 1;
         reset_timer = true;
     }
-    if (passed > 25000 && reset_timer)
+    if (passed > MYSTERY_INTERVAL_MS && reset_timer)
         m->timer = now;
 }
 
@@ -386,12 +443,8 @@ static void make_enemies_shoot(Game *g, Uint32 now)
 /* 原典 create_new_ship */
 static void create_new_ship(Game *g, Uint32 now)
 {
-    if (g->make_new_ship && (Sint32)(now - g->ship_timer) > 1600) {
-        g->ship.r.x = 375;
-        g->ship.r.y = 540;
-        g->ship.r.w = 50;
-        g->ship.r.h = 50;
-        g->ship.vx = SHIP_VX;
+    if (g->make_new_ship && (Sint32)(now - g->ship_timer) > SHIP_RESPAWN_MS) {
+        ship_place(&g->ship);
         g->make_new_ship = false;
         g->ship_alive = true;
     }
@@ -417,25 +470,9 @@ static void bullets_vs_blockers(Game *g, bool enemy, Uint32 now)
     for (int i = 0; i < cap; i++) {
         Bullet *b = &arr[i];
         if (!b->active) continue;
-        bool hit = false;
-        for (int base = 0; base < 4; base++)
-            for (int r = 0; r < BARRIER_ROWS; r++)
-                for (int c = 0; c < BARRIER_COLS; c++) {
-                    if (!g->blockers[base][r][c]) continue;
-                    SDL_Rect cell = blocker_cell_rect(base, r, c);
-                    if (overlap(&b->r, &cell)) {
-                        g->blockers[base][r][c] = false;
-                        hit = true;
-                    }
-                }
-        for (int gi = 0; gi < 200; gi++) {
-            if (!g->ground[gi]) continue;
-            SDL_Rect cell = {gi * 4, 595, 4, 4};
-            if (overlap(&b->r, &cell)) {
-                g->ground[gi] = false;
-                hit = true;
-            }
-        }
+        bool hit = blockers_erase_overlap(g, &b->r);
+        if (ground_erase_overlap(g, &b->r))
+            hit = true;
         if (hit) {
             b->active = false;
             if (enemy)
@@ -444,9 +481,10 @@ static void bullets_vs_blockers(Game *g, bool enemy, Uint32 now)
     }
 }
 
-static void check_collisions(Game *g, Uint32 now)
+/* (a) 自機弾 × 敵弾 */
+static void collide_bullets_with_bullets(Game *g)
 {
-    /* (a) 自機弾 × 敵弾: 両方消える */
+    /* 両方消える */
     for (int i = 0; i < MAX_PBULLETS; i++) {
         Bullet *b = &g->pbullets[i];
         if (!b->active) continue;
@@ -459,7 +497,11 @@ static void check_collisions(Game *g, Uint32 now)
             }
         }
     }
+}
 
+/* (b) 敵 × 自機弾 */
+static void collide_enemies_with_pbullets(Game *g, Uint32 now)
+{
     /* (b) 敵 × 自機弾: pygame の groupcollide は行優先の順に処理し、
      * 弾は最初に当たった敵で消える。その順番で写す。 */
     for (int i = 0; i < FLEET_ROWS * FLEET_COLS; i++) {
@@ -479,7 +521,11 @@ static void check_collisions(Game *g, Uint32 now)
             }
         }
     }
+}
 
+/* (c) ミステリーシップ × 自機弾 */
+static void collide_mystery_with_pbullets(Game *g, Uint32 now)
+{
     /* (c) ミステリーシップ × 自機弾 */
     for (int j = 0; j < MAX_PBULLETS; j++) {
         Bullet *b = &g->pbullets[j];
@@ -502,7 +548,11 @@ static void check_collisions(Game *g, Uint32 now)
             break;
         }
     }
+}
 
+/* (d) 自機 × 敵弾 */
+static void collide_ship_with_ebullets(Game *g, Uint32 now)
+{
     /* (d) 自機 × 敵弾 */
     if (g->ship_alive) {
         for (int j = 0; j < MAX_EBULLETS; j++) {
@@ -523,9 +573,13 @@ static void check_collisions(Game *g, Uint32 now)
             }
         }
     }
+}
 
+/* (e) 敵集団が自機の高さまで来たとき */
+static void collide_fleet_reach(Game *g, Uint32 now)
+{
     /* (e) 敵集団が自機の高さまで来たとき */
-    if (g->state == ST_PLAY && g->fleet_bottom >= 540) {
+    if (g->state == ST_PLAY && g->fleet_bottom >= FLEET_REACH_SHIP_Y) {
         if (g->ship_alive) {
             for (int i = 0; i < FLEET_ROWS * FLEET_COLS; i++) {
                 Enemy *e = &g->enemies[i];
@@ -535,30 +589,34 @@ static void check_collisions(Game *g, Uint32 now)
                 }
             }
         }
-        if (!g->ship_alive || g->fleet_bottom >= 600)
+        if (!g->ship_alive || g->fleet_bottom >= FLEET_GAMEOVER_Y)
             enter_game_over(g, now);
     }
+}
 
-    /* (f) 自機弾 × トーチカ・地面、(g) 敵弾 × トーチカ・地面。
-     * 原典の groupcollide はどちらも重なった全セルを消すので共通化した */
-    bullets_vs_blockers(g, false, now);
-    bullets_vs_blockers(g, true, now);
-
-    /* (h) 敵集団がトーチカの高さまで来たら、重なったセルが消える */
-    if (g->fleet_bottom >= BLOCKERS_POSITION) {
-        for (int i = 0; i < FLEET_ROWS * FLEET_COLS; i++) {
-            Enemy *e = &g->enemies[i];
-            if (!e->alive) continue;
-            for (int base = 0; base < 4; base++)
-                for (int r = 0; r < BARRIER_ROWS; r++)
-                    for (int c = 0; c < BARRIER_COLS; c++) {
-                        if (!g->blockers[base][r][c]) continue;
-                        SDL_Rect cell = blocker_cell_rect(base, r, c);
-                        if (overlap(&e->r, &cell))
-                            g->blockers[base][r][c] = false;
-                    }
-        }
+/* (h) 敵集団がトーチカの高さまで来たら、重なったセルが消える */
+static void collide_fleet_with_blockers(Game *g)
+{
+    if (g->fleet_bottom < BLOCKERS_POSITION)
+        return;
+    for (int i = 0; i < FLEET_ROWS * FLEET_COLS; i++) {
+        Enemy *e = &g->enemies[i];
+        if (e->alive)
+            blockers_erase_overlap(g, &e->r);
     }
+}
+
+/* 原典 check_collisions。処理の順番も原典どおり。 */
+static void check_collisions(Game *g, Uint32 now)
+{
+    collide_bullets_with_bullets(g);                  /* (a) */
+    collide_enemies_with_pbullets(g, now);            /* (b) */
+    collide_mystery_with_pbullets(g, now);            /* (c) */
+    collide_ship_with_ebullets(g, now);               /* (d) */
+    collide_fleet_reach(g, now);                      /* (e) */
+    bullets_vs_blockers(g, false, now);               /* (f) 自機弾 × トーチカ・地面 */
+    bullets_vs_blockers(g, true, now);                /* (g) 敵弾 × トーチカ・地面 */
+    collide_fleet_with_blockers(g);                   /* (h) */
 }
 
 /* 爆発の寿命の管理（原典の各 Explosion.update の消滅条件）。
@@ -590,11 +648,7 @@ void game_init(Game *g, Assets *assets)
     g->enemy_position = ENEMY_DEFAULT_POSITION;
     g->row_counter = 4;
     g->lives_spare = 3;
-    g->ship.r.x = 375;
-    g->ship.r.y = 540;
-    g->ship.r.w = 50;
-    g->ship.r.h = 50;
-    g->ship.vx = SHIP_VX;
+    ship_place(&g->ship);
     g->ship_alive = true;
     ledger_init(&g->ledger);
     build_blockers(g);
@@ -612,6 +666,8 @@ int game_update(Game *g, const Input *in, Uint32 now)
         break;
 
     case ST_GAMEOVER:
+        /* 描画は読むだけなので、爆発の寿命はここでも進める */
+        explosions_update(g, now);
         if ((Sint32)(now - g->game_over_timer) > 4000)
             g->state = ST_TITLE;
         break;
@@ -623,12 +679,12 @@ int game_update(Game *g, const Input *in, Uint32 now)
                 g->ship.vx = SHIP_VX;
             if (in->fire_keydown)
                 fire(g, now);
-            if ((Sint32)(now - g->game_timer) > 3000) {
+            if ((Sint32)(now - g->game_timer) > NEXT_ROUND_DELAY_MS) {
                 g->round_num += 1;
                 build_blockers(g);
                 g->enemy_position = ENEMY_DEFAULT_POSITION;
                 reset_round(g, g->score, now);
-                g->game_timer += 3000;
+                g->game_timer += NEXT_ROUND_DELAY_MS;
             }
             break;
         }
@@ -664,16 +720,16 @@ static void draw_tex(Game *g, SDL_Renderer *ren, int tex, int x, int y, int w, i
 static void draw_blockers(Game *g, SDL_Renderer *ren)
 {
     SDL_SetRenderDrawColor(ren, COL_RED.r, COL_RED.g, COL_RED.b, 255);
-    for (int base = 0; base < 4; base++)
+    for (int base = 0; base < BLOCKER_COUNT; base++)
         for (int r = 0; r < BARRIER_ROWS; r++)
             for (int c = 0; c < BARRIER_COLS; c++) {
                 if (!g->blockers[base][r][c]) continue;
                 SDL_Rect cell = blocker_cell_rect(base, r, c);
                 SDL_RenderFillRect(ren, &cell);
             }
-    for (int gi = 0; gi < 200; gi++) {
+    for (int gi = 0; gi < GROUND_CELLS; gi++) {
         if (!g->ground[gi]) continue;
-        SDL_Rect cell = {gi * 4, 595, 4, 4};
+        SDL_Rect cell = {gi * GROUND_CELL_W, GROUND_Y, GROUND_CELL_W, GROUND_CELL_W};
         SDL_RenderFillRect(ren, &cell);
     }
 }
@@ -753,7 +809,7 @@ static void draw_play_scene(Game *g, SDL_Renderer *ren, Uint32 now)
     assets_draw_text(g->assets, ren, 20, buf, COL_WHITE, 325, 5);
 
     if (g->ship_alive)
-        draw_tex(g, ren, TEX_SHIP, g->ship.r.x, g->ship.r.y, 50, 50);
+        draw_tex(g, ren, TEX_SHIP, g->ship.r.x, g->ship.r.y, SHIP_W, SHIP_H);
 
     for (int i = 0; i < FLEET_ROWS * FLEET_COLS; i++) {
         Enemy *e = &g->enemies[i];
@@ -782,9 +838,8 @@ static void draw_play_scene(Game *g, SDL_Renderer *ren, Uint32 now)
     draw_explosions(g, ren, now);
 }
 
-void game_render(Game *g, SDL_Renderer *renderer)
+void game_render(Game *g, SDL_Renderer *renderer, Uint32 now)
 {
-    Uint32 now = SDL_GetTicks();
     SDL_RenderClear(renderer);
     switch (g->state) {
     case ST_TITLE:
