@@ -1,0 +1,688 @@
+From 06a816e701692ad0f00ff00f83495722117d6b44 Mon Sep 17 00:00:00 2001
+From: review <review@example.invalid>
+Date: Sun, 15 Nov 2026 06:24:20 +0000
+Subject: [PATCH] Review follow-up: audio-optional startup, shared frame time,
+ 60fps pacing, collision split, named constants, cleanup
+
+---
+ space_invaders_c/README.md    |   9 ++
+ space_invaders_c/src/assets.c |   9 +-
+ space_invaders_c/src/assets.h |   7 +-
+ space_invaders_c/src/game.c   | 197 ++++++++++++++++++++++------------
+ space_invaders_c/src/game.h   |  36 ++++++-
+ space_invaders_c/src/main.c   | 105 ++++++++++++------
+ 6 files changed, 251 insertions(+), 112 deletions(-)
+
+diff --git a/space_invaders_c/README.md b/space_invaders_c/README.md
+index dc2ca48..5653e45 100644
+--- a/space_invaders_c/README.md
++++ b/space_invaders_c/README.md
+@@ -50,6 +50,15 @@ make test       # 画面に依存しないロジックの単体テスト
+ - **ミステリーシップ音の専用チャンネル**: 出現音は予約した専用チャンネル（0番）で鳴らします。以前は再生時のチャンネル番号を使い回していたため、音が終わったあとに別の効果音が同じ番号を使うと、その音をフェードアウトや停止で切ってしまう可能性がありました
+ - **自機弾とトーチカの当たり**: 原典は重なったセルを全部消しますが、C版は最初に当たった1セルだけを消していました。原典どおり全セルを消すようにし、敵弾側と処理を共通化しました
+ 
++## 2回目のレビューを受けて直したところ
++
++- **音声デバイスがなくても起動します**: 音声の初期化に失敗したときは、警告を出して音なしで続行します（WSL、CI、音声デバイスのない環境など）。このとき音の読み込みも行いません
++- **更新と描画で同じ時刻を使います**: `game_render` は `now` を引数に取り、`game_update` と同じ時刻で爆発などを描きます
++- **フレーム間隔を 60fps に合わせました**: 以前は 16ms 待つ方式で約 62.5fps になり、フレーム単位で動く量（弾の速さなど）がわずかに速くなっていました。高精度タイマーで次のフレームの開始時刻を積み上げて待ちます
++- **ゲームオーバー中も爆発の寿命を進めます**（`explosions_update`）
++- **起動の後始末**: 途中の初期化や素材の読み込みに失敗しても、それまでに確保したものを解放して終了します
++- **`check_collisions` を分割**（(a)〜(h) をそれぞれ関数に。処理の順番は原典どおり）し、トーチカ・地面・自機・時間の数値に名前を付けました（`game.h`）。トーチカの判定は、基ごとの囲み矩形に触れたときだけセルを調べます
++
+ ## このフォルダにある検証用のもの
+ 
+ - `.sdl/` と実行ファイル `space_invaders_c` は、作成した環境（Muse の VM）での検証用です。この VM では apt の依存関係の都合で SDL2 開発パッケージを通常インストールできなかったため、deb パッケージを展開したものを `.sdl/` に置いてビルドしました。通常の環境では上の手順どおり `make` だけでビルドできます
+diff --git a/space_invaders_c/src/assets.c b/space_invaders_c/src/assets.c
+index 77ab5b9..f8f6e85 100644
+--- a/space_invaders_c/src/assets.c
++++ b/space_invaders_c/src/assets.c
+@@ -48,7 +48,8 @@ static void join_path(char *dst, size_t cap, const char *base, const char *rel)
+     snprintf(dst, cap, "%s%s", base, rel);
+ }
+ 
+-int assets_load(Assets *a, SDL_Renderer *renderer, const char *base_path)
++int assets_load(Assets *a, SDL_Renderer *renderer, const char *base_path,
++                int load_sounds)
+ {
+     char path[1024];
+     memset(a, 0, sizeof *a);
+@@ -58,20 +59,23 @@ int assets_load(Assets *a, SDL_Renderer *renderer, const char *base_path)
+         SDL_Surface *surf = IMG_Load(path);
+         if (!surf) {
+             fprintf(stderr, "image load failed: %s: %s\n", path, IMG_GetError());
++            assets_free(a);
+             return 0;
+         }
+         a->tex[i] = SDL_CreateTextureFromSurface(renderer, surf);
+         SDL_FreeSurface(surf);
+         if (!a->tex[i]) {
+             fprintf(stderr, "texture create failed: %s\n", path);
++            assets_free(a);
+             return 0;
+         }
+     }
+-    for (int i = 0; i < SND_COUNT; i++) {
++    for (int i = 0; load_sounds && i < SND_COUNT; i++) {
+         join_path(path, sizeof path, base_path, SND_FILES[i]);
+         a->snd[i] = Mix_LoadWAV(path);
+         if (!a->snd[i]) {
+             fprintf(stderr, "sound load failed: %s: %s\n", path, Mix_GetError());
++            assets_free(a);
+             return 0;
+         }
+         /* 原典は全ての音を set_volume(0.1) している */
+@@ -84,6 +88,7 @@ int assets_load(Assets *a, SDL_Renderer *renderer, const char *base_path)
+     a->font50 = TTF_OpenFont(path, 50);
+     if (!a->font20 || !a->font25 || !a->font50) {
+         fprintf(stderr, "font load failed: %s: %s\n", path, TTF_GetError());
++        assets_free(a);
+         return 0;
+     }
+     return 1;
+diff --git a/space_invaders_c/src/assets.h b/space_invaders_c/src/assets.h
+index 8dc2f08..6692017 100644
+--- a/space_invaders_c/src/assets.h
++++ b/space_invaders_c/src/assets.h
+@@ -41,8 +41,11 @@ typedef struct {
+ } Assets;
+ 
+ /* base_path は素材フォルダのあるディレクトリ（末尾に '/' を含む想定）。
+- * 失敗したら stderr に理由を出して 0 を返す。 */
+-int assets_load(Assets *a, SDL_Renderer *renderer, const char *base_path);
++ * load_sounds が 0 のときは音を読まない（音声デバイスが使えない環境用）。
++ * その場合 snd[] は NULL のままで、assets_play 系は何もせず -1 を返す。
++ * 失敗したら stderr に理由を出し、読み込み済みの分を解放して 0 を返す。 */
++int assets_load(Assets *a, SDL_Renderer *renderer, const char *base_path,
++                int load_sounds);
+ void assets_free(Assets *a);
+ 
+ /* 文字をその場で描く（原典の Text.draw 相当）。size は 20/25/50 のみ。 */
+diff --git a/space_invaders_c/src/game.c b/space_invaders_c/src/game.c
+index dad25b3..fe5846a 100644
+--- a/space_invaders_c/src/game.c
++++ b/space_invaders_c/src/game.c
+@@ -106,29 +106,86 @@ static void spawn_bullet(Game *g, bool enemy, int x, int y, int direction,
+  * 重なって生成されるため、見た目と判定が等価な1本にまとめた。 */
+ static void build_blockers(Game *g)
+ {
+-    for (int b = 0; b < 4; b++)
++    for (int b = 0; b < BLOCKER_COUNT; b++)
+         for (int r = 0; r < BARRIER_ROWS; r++)
+             for (int c = 0; c < BARRIER_COLS; c++)
+                 g->blockers[b][r][c] = BARRIER_DESIGN[r][c] != 0;
+-    for (int i = 0; i < 200; i++)
++    for (int i = 0; i < GROUND_CELLS; i++)
+         g->ground[i] = true;
+ }
+ 
+ static SDL_Rect blocker_cell_rect(int base, int row, int col)
+ {
+-    SDL_Rect r = {60 + 200 * base + col * 3, BLOCKERS_POSITION + 25 + row * 3, 3, 3};
++    SDL_Rect r = {BLOCKER_X0 + BLOCKER_PITCH * base + col * BLOCKER_CELL,
++                  BLOCKERS_POSITION + BLOCKER_Y_OFFSET + row * BLOCKER_CELL,
++                  BLOCKER_CELL, BLOCKER_CELL};
+     return r;
+ }
+ 
++/* 1基ぶんのセル全体を囲む矩形。弾や敵がここに触れないなら、その基の
++ * セルは1つずつ調べなくてよい（早期除外）。 */
++static SDL_Rect blocker_base_area(int base)
++{
++    SDL_Rect r = {BLOCKER_X0 + BLOCKER_PITCH * base,
++                  BLOCKERS_POSITION + BLOCKER_Y_OFFSET,
++                  BARRIER_COLS * BLOCKER_CELL, BARRIER_ROWS * BLOCKER_CELL};
++    return r;
++}
++
++/* r に重なるトーチカのセルを全部消す（原典の groupcollide の dokill）。
++ * 1つでも消したら true。 */
++static bool blockers_erase_overlap(Game *g, const SDL_Rect *r)
++{
++    bool hit = false;
++    for (int base = 0; base < BLOCKER_COUNT; base++) {
++        SDL_Rect area = blocker_base_area(base);
++        if (!overlap(r, &area))
++            continue;
++        for (int row = 0; row < BARRIER_ROWS; row++)
++            for (int col = 0; col < BARRIER_COLS; col++) {
++                if (!g->blockers[base][row][col]) continue;
++                SDL_Rect cell = blocker_cell_rect(base, row, col);
++                if (overlap(r, &cell)) {
++                    g->blockers[base][row][col] = false;
++                    hit = true;
++                }
++            }
++    }
++    return hit;
++}
++
++/* r に重なる地面のセルを全部消す。1つでも消したら true。 */
++static bool ground_erase_overlap(Game *g, const SDL_Rect *r)
++{
++    if (r->y + r->h <= GROUND_Y || r->y >= GROUND_Y + GROUND_CELL_W)
++        return false;
++    bool hit = false;
++    for (int gi = 0; gi < GROUND_CELLS; gi++) {
++        if (!g->ground[gi]) continue;
++        SDL_Rect cell = {gi * GROUND_CELL_W, GROUND_Y, GROUND_CELL_W, GROUND_CELL_W};
++        if (overlap(r, &cell)) {
++            g->ground[gi] = false;
++            hit = true;
++        }
++    }
++    return hit;
++}
++
++/* 自機を初期位置に置く（開始・ラウンド開始・再出撃で共通）。 */
++static void ship_place(Ship *s)
++{
++    s->r.x = SHIP_START_X;
++    s->r.y = SHIP_START_Y;
++    s->r.w = SHIP_W;
++    s->r.h = SHIP_H;
++    s->vx = SHIP_VX;
++}
++
+ /* 原典 reset(score)。残機（lives_spare）はここでは変えない。 */
+ static void reset_round(Game *g, int score, Uint32 now)
+ {
+     g->score = score;
+-    g->ship.r.x = 375;
+-    g->ship.r.y = 540;
+-    g->ship.r.w = 50;
+-    g->ship.r.h = 50;
+-    g->ship.vx = SHIP_VX;
++    ship_place(&g->ship);
+     g->ship_alive = true;
+     g->make_new_ship = false;
+     g->ship_timer = now;
+@@ -324,7 +381,7 @@ static void mystery_update(Game *g, Uint32 now)
+     m->visible = false;
+     Uint32 passed = now - m->timer;
+     bool reset_timer = false;
+-    if (passed > 25000) {
++    if (passed > MYSTERY_INTERVAL_MS) {
+         if ((m->r.x < 0 || m->r.x > 800) && m->play_sound) {
+             /* 専用チャンネル（予約済み）で鳴らす。以後のフェードアウトや
+              * 停止はこの音にだけかかる */
+@@ -354,7 +411,7 @@ static void mystery_update(Game *g, Uint32 now)
+         m->direction = 1;
+         reset_timer = true;
+     }
+-    if (passed > 25000 && reset_timer)
++    if (passed > MYSTERY_INTERVAL_MS && reset_timer)
+         m->timer = now;
+ }
+ 
+@@ -386,12 +443,8 @@ static void make_enemies_shoot(Game *g, Uint32 now)
+ /* 原典 create_new_ship */
+ static void create_new_ship(Game *g, Uint32 now)
+ {
+-    if (g->make_new_ship && (Sint32)(now - g->ship_timer) > 1600) {
+-        g->ship.r.x = 375;
+-        g->ship.r.y = 540;
+-        g->ship.r.w = 50;
+-        g->ship.r.h = 50;
+-        g->ship.vx = SHIP_VX;
++    if (g->make_new_ship && (Sint32)(now - g->ship_timer) > SHIP_RESPAWN_MS) {
++        ship_place(&g->ship);
+         g->make_new_ship = false;
+         g->ship_alive = true;
+     }
+@@ -417,25 +470,9 @@ static void bullets_vs_blockers(Game *g, bool enemy, Uint32 now)
+     for (int i = 0; i < cap; i++) {
+         Bullet *b = &arr[i];
+         if (!b->active) continue;
+-        bool hit = false;
+-        for (int base = 0; base < 4; base++)
+-            for (int r = 0; r < BARRIER_ROWS; r++)
+-                for (int c = 0; c < BARRIER_COLS; c++) {
+-                    if (!g->blockers[base][r][c]) continue;
+-                    SDL_Rect cell = blocker_cell_rect(base, r, c);
+-                    if (overlap(&b->r, &cell)) {
+-                        g->blockers[base][r][c] = false;
+-                        hit = true;
+-                    }
+-                }
+-        for (int gi = 0; gi < 200; gi++) {
+-            if (!g->ground[gi]) continue;
+-            SDL_Rect cell = {gi * 4, 595, 4, 4};
+-            if (overlap(&b->r, &cell)) {
+-                g->ground[gi] = false;
+-                hit = true;
+-            }
+-        }
++        bool hit = blockers_erase_overlap(g, &b->r);
++        if (ground_erase_overlap(g, &b->r))
++            hit = true;
+         if (hit) {
+             b->active = false;
+             if (enemy)
+@@ -444,9 +481,10 @@ static void bullets_vs_blockers(Game *g, bool enemy, Uint32 now)
+     }
+ }
+ 
+-static void check_collisions(Game *g, Uint32 now)
++/* (a) 自機弾 × 敵弾 */
++static void collide_bullets_with_bullets(Game *g)
+ {
+-    /* (a) 自機弾 × 敵弾: 両方消える */
++    /* 両方消える */
+     for (int i = 0; i < MAX_PBULLETS; i++) {
+         Bullet *b = &g->pbullets[i];
+         if (!b->active) continue;
+@@ -459,7 +497,11 @@ static void check_collisions(Game *g, Uint32 now)
+             }
+         }
+     }
++}
+ 
++/* (b) 敵 × 自機弾 */
++static void collide_enemies_with_pbullets(Game *g, Uint32 now)
++{
+     /* (b) 敵 × 自機弾: pygame の groupcollide は行優先の順に処理し、
+      * 弾は最初に当たった敵で消える。その順番で写す。 */
+     for (int i = 0; i < FLEET_ROWS * FLEET_COLS; i++) {
+@@ -479,7 +521,11 @@ static void check_collisions(Game *g, Uint32 now)
+             }
+         }
+     }
++}
+ 
++/* (c) ミステリーシップ × 自機弾 */
++static void collide_mystery_with_pbullets(Game *g, Uint32 now)
++{
+     /* (c) ミステリーシップ × 自機弾 */
+     for (int j = 0; j < MAX_PBULLETS; j++) {
+         Bullet *b = &g->pbullets[j];
+@@ -502,7 +548,11 @@ static void check_collisions(Game *g, Uint32 now)
+             break;
+         }
+     }
++}
+ 
++/* (d) 自機 × 敵弾 */
++static void collide_ship_with_ebullets(Game *g, Uint32 now)
++{
+     /* (d) 自機 × 敵弾 */
+     if (g->ship_alive) {
+         for (int j = 0; j < MAX_EBULLETS; j++) {
+@@ -523,9 +573,13 @@ static void check_collisions(Game *g, Uint32 now)
+             }
+         }
+     }
++}
+ 
++/* (e) 敵集団が自機の高さまで来たとき */
++static void collide_fleet_reach(Game *g, Uint32 now)
++{
+     /* (e) 敵集団が自機の高さまで来たとき */
+-    if (g->state == ST_PLAY && g->fleet_bottom >= 540) {
++    if (g->state == ST_PLAY && g->fleet_bottom >= FLEET_REACH_SHIP_Y) {
+         if (g->ship_alive) {
+             for (int i = 0; i < FLEET_ROWS * FLEET_COLS; i++) {
+                 Enemy *e = &g->enemies[i];
+@@ -535,32 +589,36 @@ static void check_collisions(Game *g, Uint32 now)
+                 }
+             }
+         }
+-        if (!g->ship_alive || g->fleet_bottom >= 600)
++        if (!g->ship_alive || g->fleet_bottom >= FLEET_GAMEOVER_Y)
+             enter_game_over(g, now);
+     }
++}
+ 
+-    /* (f) 自機弾 × トーチカ・地面、(g) 敵弾 × トーチカ・地面。
+-     * 原典の groupcollide はどちらも重なった全セルを消すので共通化した */
+-    bullets_vs_blockers(g, false, now);
+-    bullets_vs_blockers(g, true, now);
+-
+-    /* (h) 敵集団がトーチカの高さまで来たら、重なったセルが消える */
+-    if (g->fleet_bottom >= BLOCKERS_POSITION) {
+-        for (int i = 0; i < FLEET_ROWS * FLEET_COLS; i++) {
+-            Enemy *e = &g->enemies[i];
+-            if (!e->alive) continue;
+-            for (int base = 0; base < 4; base++)
+-                for (int r = 0; r < BARRIER_ROWS; r++)
+-                    for (int c = 0; c < BARRIER_COLS; c++) {
+-                        if (!g->blockers[base][r][c]) continue;
+-                        SDL_Rect cell = blocker_cell_rect(base, r, c);
+-                        if (overlap(&e->r, &cell))
+-                            g->blockers[base][r][c] = false;
+-                    }
+-        }
++/* (h) 敵集団がトーチカの高さまで来たら、重なったセルが消える */
++static void collide_fleet_with_blockers(Game *g)
++{
++    if (g->fleet_bottom < BLOCKERS_POSITION)
++        return;
++    for (int i = 0; i < FLEET_ROWS * FLEET_COLS; i++) {
++        Enemy *e = &g->enemies[i];
++        if (e->alive)
++            blockers_erase_overlap(g, &e->r);
+     }
+ }
+ 
++/* 原典 check_collisions。処理の順番も原典どおり。 */
++static void check_collisions(Game *g, Uint32 now)
++{
++    collide_bullets_with_bullets(g);                  /* (a) */
++    collide_enemies_with_pbullets(g, now);            /* (b) */
++    collide_mystery_with_pbullets(g, now);            /* (c) */
++    collide_ship_with_ebullets(g, now);               /* (d) */
++    collide_fleet_reach(g, now);                      /* (e) */
++    bullets_vs_blockers(g, false, now);               /* (f) 自機弾 × トーチカ・地面 */
++    bullets_vs_blockers(g, true, now);                /* (g) 敵弾 × トーチカ・地面 */
++    collide_fleet_with_blockers(g);                   /* (h) */
++}
++
+ /* 爆発の寿命の管理（原典の各 Explosion.update の消滅条件）。
+  * 描画側では状態を書き換えないよう、消滅判定はここ（更新側）に置く。
+  * ラウンド遷移の条件（explosion_count == 0）も更新側だけで決まる。 */
+@@ -590,11 +648,7 @@ void game_init(Game *g, Assets *assets)
+     g->enemy_position = ENEMY_DEFAULT_POSITION;
+     g->row_counter = 4;
+     g->lives_spare = 3;
+-    g->ship.r.x = 375;
+-    g->ship.r.y = 540;
+-    g->ship.r.w = 50;
+-    g->ship.r.h = 50;
+-    g->ship.vx = SHIP_VX;
++    ship_place(&g->ship);
+     g->ship_alive = true;
+     ledger_init(&g->ledger);
+     build_blockers(g);
+@@ -612,6 +666,8 @@ int game_update(Game *g, const Input *in, Uint32 now)
+         break;
+ 
+     case ST_GAMEOVER:
++        /* 描画は読むだけなので、爆発の寿命はここでも進める */
++        explosions_update(g, now);
+         if ((Sint32)(now - g->game_over_timer) > 4000)
+             g->state = ST_TITLE;
+         break;
+@@ -623,12 +679,12 @@ int game_update(Game *g, const Input *in, Uint32 now)
+                 g->ship.vx = SHIP_VX;
+             if (in->fire_keydown)
+                 fire(g, now);
+-            if ((Sint32)(now - g->game_timer) > 3000) {
++            if ((Sint32)(now - g->game_timer) > NEXT_ROUND_DELAY_MS) {
+                 g->round_num += 1;
+                 build_blockers(g);
+                 g->enemy_position = ENEMY_DEFAULT_POSITION;
+                 reset_round(g, g->score, now);
+-                g->game_timer += 3000;
++                g->game_timer += NEXT_ROUND_DELAY_MS;
+             }
+             break;
+         }
+@@ -664,16 +720,16 @@ static void draw_tex(Game *g, SDL_Renderer *ren, int tex, int x, int y, int w, i
+ static void draw_blockers(Game *g, SDL_Renderer *ren)
+ {
+     SDL_SetRenderDrawColor(ren, COL_RED.r, COL_RED.g, COL_RED.b, 255);
+-    for (int base = 0; base < 4; base++)
++    for (int base = 0; base < BLOCKER_COUNT; base++)
+         for (int r = 0; r < BARRIER_ROWS; r++)
+             for (int c = 0; c < BARRIER_COLS; c++) {
+                 if (!g->blockers[base][r][c]) continue;
+                 SDL_Rect cell = blocker_cell_rect(base, r, c);
+                 SDL_RenderFillRect(ren, &cell);
+             }
+-    for (int gi = 0; gi < 200; gi++) {
++    for (int gi = 0; gi < GROUND_CELLS; gi++) {
+         if (!g->ground[gi]) continue;
+-        SDL_Rect cell = {gi * 4, 595, 4, 4};
++        SDL_Rect cell = {gi * GROUND_CELL_W, GROUND_Y, GROUND_CELL_W, GROUND_CELL_W};
+         SDL_RenderFillRect(ren, &cell);
+     }
+ }
+@@ -753,7 +809,7 @@ static void draw_play_scene(Game *g, SDL_Renderer *ren, Uint32 now)
+     assets_draw_text(g->assets, ren, 20, buf, COL_WHITE, 325, 5);
+ 
+     if (g->ship_alive)
+-        draw_tex(g, ren, TEX_SHIP, g->ship.r.x, g->ship.r.y, 50, 50);
++        draw_tex(g, ren, TEX_SHIP, g->ship.r.x, g->ship.r.y, SHIP_W, SHIP_H);
+ 
+     for (int i = 0; i < FLEET_ROWS * FLEET_COLS; i++) {
+         Enemy *e = &g->enemies[i];
+@@ -782,9 +838,8 @@ static void draw_play_scene(Game *g, SDL_Renderer *ren, Uint32 now)
+     draw_explosions(g, ren, now);
+ }
+ 
+-void game_render(Game *g, SDL_Renderer *renderer)
++void game_render(Game *g, SDL_Renderer *renderer, Uint32 now)
+ {
+-    Uint32 now = SDL_GetTicks();
+     SDL_RenderClear(renderer);
+     switch (g->state) {
+     case ST_TITLE:
+diff --git a/space_invaders_c/src/game.h b/space_invaders_c/src/game.h
+index 3165e36..b642ae2 100644
+--- a/space_invaders_c/src/game.h
++++ b/space_invaders_c/src/game.h
+@@ -21,6 +21,33 @@
+ #define ENEMY_MOVE_DOWN 35
+ #define BLOCKERS_POSITION 450
+ 
++/* 自機 */
++#define SHIP_START_X 375
++#define SHIP_START_Y 540
++#define SHIP_W 50
++#define SHIP_H 50
++#define SHIP_RESPAWN_MS 1600        /* 被弾から再出撃まで */
++
++/* 進行の時間 */
++#define NEXT_ROUND_DELAY_MS 3000    /* 全滅から次のラウンドまで */
++#define MYSTERY_INTERVAL_MS 25000   /* ミステリーシップの出現周期 */
++
++/* 敵集団の到達ライン（fleet_bottom との比較） */
++#define FLEET_REACH_SHIP_Y SHIP_START_Y  /* 自機の高さ。重なれば自機が消える */
++#define FLEET_GAMEOVER_Y 600             /* ここまで来たらゲームオーバー */
++
++/* トーチカ（4基。1セル 3x3、BARRIER_COLS x BARRIER_ROWS のセル） */
++#define BLOCKER_COUNT 4
++#define BLOCKER_X0 60
++#define BLOCKER_PITCH 200
++#define BLOCKER_Y_OFFSET 25         /* BLOCKERS_POSITION からの下がり */
++#define BLOCKER_CELL 3
++
++/* 地面（y=GROUND_Y に 4x4 のセルを横一列） */
++#define GROUND_Y 595
++#define GROUND_CELLS 200
++#define GROUND_CELL_W 4
++
+ /* ミステリーシップ出現音の専用チャンネル。main.c が起動時に
+  * Mix_ReserveChannels(1) で予約する。通常の効果音（-1 指定）は
+  * このチャンネルを使わないので、後からのフェードアウトや停止が
+@@ -114,8 +141,8 @@ typedef struct {
+     Mystery mystery;
+     Explosion explosions[MAX_EXPLOSIONS];
+ 
+-    bool blockers[4][BARRIER_ROWS][BARRIER_COLS];
+-    bool ground[200];       /* y=595 の地面（1セル 4px） */
++    bool blockers[BLOCKER_COUNT][BARRIER_ROWS][BARRIER_COLS];
++    bool ground[GROUND_CELLS]; /* 地面（1セル GROUND_CELL_W px） */
+ 
+     Uint32 shoot_timer;     /* 原典 self.timer（敵の発射間隔の基準） */
+     Uint32 note_timer;
+@@ -127,7 +154,8 @@ typedef struct {
+ void game_init(Game *g, Assets *assets);
+ /* 1フレーム分の更新。now は SDL_GetTicks()。戻り値 0 で終了。 */
+ int game_update(Game *g, const Input *in, Uint32 now);
+-/* 現在の状態を描く。 */
+-void game_render(Game *g, SDL_Renderer *renderer);
++/* 現在の状態を描く。now は game_update に渡したものと同じ時刻を使う
++ * （更新と描画で時刻がずれないようにするため）。 */
++void game_render(Game *g, SDL_Renderer *renderer, Uint32 now);
+ 
+ #endif /* SI_GAME_H */
+diff --git a/space_invaders_c/src/main.c b/space_invaders_c/src/main.c
+index 9856c0c..93d06f1 100644
+--- a/space_invaders_c/src/main.c
++++ b/space_invaders_c/src/main.c
+@@ -54,6 +54,23 @@ static void build_input(Input *in, int smoke_frame)
+     }
+ }
+ 
++/* 目標は 60fps。フレームの長さを整数ミリ秒に丸めると 62.5fps になって
++ * フレーム単位で動く量（弾の速さなど）がわずかに速くなるため、
++ * 高精度タイマーで「次のフレームの開始時刻」を積み上げて待つ。 */
++static void wait_for_next_frame(Uint64 *next, Uint64 freq)
++{
++    *next += freq / 60;
++    Uint64 t = SDL_GetPerformanceCounter();
++    if (*next > t) {
++        Uint32 ms = (Uint32)((*next - t) * 1000 / freq);
++        if (ms > 0)
++            SDL_Delay(ms);
++    } else if (t - *next > freq / 10) {
++        /* 大きく遅れたら（ウィンドウ移動など）追いつこうとせず仕切り直す */
++        *next = t;
++    }
++}
++
+ int main(int argc, char **argv)
+ {
+     (void)argc;
+@@ -64,63 +81,80 @@ int main(int argc, char **argv)
+ 
+     srand((unsigned)(SDL_GetTicks() ^ time(NULL)));
+ 
+-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) {
++    int status = 1;
++    SDL_Window *window = NULL;
++    SDL_Renderer *renderer = NULL;
++    Assets assets;
++    bool assets_ready = false;
++    bool img_ready = false, ttf_ready = false, audio_ready = false;
++
++    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
+         return 1;
+     }
+     if ((IMG_Init(IMG_INIT_PNG | IMG_INIT_JPG) & (IMG_INIT_PNG | IMG_INIT_JPG)) == 0) {
+         fprintf(stderr, "IMG_Init failed: %s\n", IMG_GetError());
+-        return 1;
++        goto done;
+     }
++    img_ready = true;
+     if (TTF_Init() != 0) {
+         fprintf(stderr, "TTF_Init failed: %s\n", TTF_GetError());
+-        return 1;
++        goto done;
+     }
+-    /* 原典の mixer.pre_init(44100, -16, 1, 4096) に合わせる */
+-    if (Mix_OpenAudio(44100, AUDIO_S16SYS, 1, 4096) != 0) {
+-        fprintf(stderr, "Mix_OpenAudio failed: %s\n", Mix_GetError());
+-        return 1;
++    ttf_ready = true;
++
++    /* 音は無くても遊べるので、音声デバイスが使えなくても続行する
++     * （WSL・CI・音声デバイスのない環境など）。
++     * 原典の mixer.pre_init(44100, -16, 1, 4096) に合わせる。 */
++    if (SDL_InitSubSystem(SDL_INIT_AUDIO) == 0 &&
++        Mix_OpenAudio(44100, AUDIO_S16SYS, 1, 4096) == 0) {
++        audio_ready = true;
++        /* チャンネル0をミステリーシップ出現音の専用に予約する（game.h） */
++        Mix_ReserveChannels(1);
++    } else {
++        fprintf(stderr, "audio unavailable, continuing without sound: %s\n",
++                SDL_GetError()[0] ? SDL_GetError() : Mix_GetError());
+     }
+-    /* チャンネル0をミステリーシップ出現音の専用に予約する（game.h） */
+-    Mix_ReserveChannels(1);
+ 
+-    SDL_Window *window = SDL_CreateWindow(
++    window = SDL_CreateWindow(
+         "Space Invaders", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+         SCREEN_W, SCREEN_H, SDL_WINDOW_RESIZABLE);
+     if (!window) {
+         fprintf(stderr, "window failed: %s\n", SDL_GetError());
+-        return 1;
++        goto done;
+     }
+-    SDL_Renderer *renderer = SDL_CreateRenderer(
++    renderer = SDL_CreateRenderer(
+         window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+     if (!renderer)
+         renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
+     if (!renderer) {
+         fprintf(stderr, "renderer failed: %s\n", SDL_GetError());
+-        return 1;
++        goto done;
+     }
+     /* 原典の SCALED 相当: 論理画面を 800x600 に固定する */
+     SDL_RenderSetLogicalSize(renderer, SCREEN_W, SCREEN_H);
+ 
+     char *base = SDL_GetBasePath();
+-    Assets assets;
+-    if (!assets_load(&assets, renderer, base ? base : "./")) {
+-        if (base) SDL_free(base);
+-        return 1;
+-    }
+-    if (base) SDL_free(base);
++    assets_ready = assets_load(&assets, renderer, base ? base : "./", audio_ready);
++    if (base)
++        SDL_free(base);
++    if (!assets_ready)
++        goto done;
+ 
+     Game game;
+     game_init(&game, &assets);
+ 
++    const Uint64 freq = SDL_GetPerformanceFrequency();
++    Uint64 next_frame = SDL_GetPerformanceCounter();
+     int frame = 0;
+     int running = 1;
+     while (running) {
+-        Uint32 frame_start = SDL_GetTicks();
++        /* 更新と描画で同じ時刻を使う（爆発の経過時間などがずれないように） */
++        Uint32 now = SDL_GetTicks();
+         Input in;
+         build_input(&in, smoke_frames >= 0 ? frame : -1);
+-        running = game_update(&game, &in, frame_start);
+-        game_render(&game, renderer);
++        running = game_update(&game, &in, now);
++        game_render(&game, renderer, now);
+         frame++;
+ 
+         if (smoke_frames >= 0 && frame >= smoke_frames) {
+@@ -130,18 +164,23 @@ int main(int argc, char **argv)
+             break;
+         }
+ 
+-        /* 原典の clock.tick(60) 相当 */
+-        Uint32 elapsed = SDL_GetTicks() - frame_start;
+-        if (elapsed < 16)
+-            SDL_Delay(16 - elapsed);
++        wait_for_next_frame(&next_frame, freq);
+     }
++    status = 0;
+ 
+-    assets_free(&assets);
+-    SDL_DestroyRenderer(renderer);
+-    SDL_DestroyWindow(window);
+-    Mix_CloseAudio();
+-    TTF_Quit();
+-    IMG_Quit();
++done:
++    if (assets_ready)
++        assets_free(&assets);
++    if (renderer)
++        SDL_DestroyRenderer(renderer);
++    if (window)
++        SDL_DestroyWindow(window);
++    if (audio_ready)
++        Mix_CloseAudio();
++    if (ttf_ready)
++        TTF_Quit();
++    if (img_ready)
++        IMG_Quit();
+     SDL_Quit();
+-    return 0;
++    return status;
+ }
+-- 
+2.43.0
+
